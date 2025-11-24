@@ -29,7 +29,7 @@ volatile bool finished = false;
 volatile bool wifiActive = false;
 volatile bool screenActive = true;
 
-// 🆕 SISTEMA PING/PONG PARA DETECCIÓN DE CONEXIÓN
+// SISTEMA PING/PONG PARA DETECCIÓN DE CONEXIÓN
 volatile bool plateConnected = false;
 uint32_t lastPingTime = 0;
 const uint32_t PING_TIMEOUT_MS = 3000; // 3 segundos sin PING = desconectado
@@ -80,14 +80,13 @@ void debugButtonState() {
     if (millis() - lastDebug > 500) {
         lastDebug = millis();
         bool currentState = digitalRead(PIN_START);
-        Serial.printf("🔘 BOTÓN: %s | running: %d | finished: %d | Plate: %s\n",
-                     currentState ? "HIGH" : "LOW ", running, finished, 
-                     plateConnected ? "CONECTADO" : "DESCONECTADO");
+        Serial.printf("🔘 BOTÓN: %s | running: %d | finished: %d | lastStopTime: %.2f\n",
+                     currentState ? "HIGH" : "LOW ", running, finished, lastStopTime);
     }
 }
 
 // ============================================================================
-// GESTIÓN DEL BOTÓN
+// GESTIÓN DEL BOTÓN CORREGIDA
 // ============================================================================
 void handleButton() {
     bool currentState = digitalRead(PIN_START);
@@ -100,9 +99,11 @@ void handleButton() {
         return;
     }
     
-    // BLOQUEAR PULSACIONES CORTAS SI HAY ÚLTIMO TIEMPO
-    if (finished && lastStopTime >= 0) {
-        // ⚠️ Solo permitir pulsación larga para reinicio
+    // 🆕 CORRECCIÓN: BLOQUEAR COMPLETAMENTE SI HAY ÚLTIMO TIEMPO MOSTRÁNDOSE
+    if (finished && lastStopTime >= 0 && screenActive) {
+        Serial.printf("🔒 MODO BLOQUEADO - Tiempo: %.2f s | Solo pulsación larga permitida\n", lastStopTime);
+        
+        // 🆕 SOLO DETECTAR PULSACIÓN LARGA
         if (lastButtonState == HIGH && currentState == LOW) {
             // Flanco descendente - botón presionado
             pressStartTime = millis();
@@ -121,18 +122,24 @@ void handleButton() {
             
             if (showingProgress) {
                 Serial.println("⏹️ Liberado durante progreso - ignorar");
+                lastButtonState = currentState;
                 return;
             }
             
-            // BLOQUEAR PULSACIONES CORTAS
-            if (duration > 100 && duration < 1000) {
-                Serial.println("❌ Pulsación corta BLOQUEADA - Solo reinicio permitido");
+            // 🆕 BLOQUEAR TODAS LAS PULSACIONES CORTAS Y MEDIAS
+            if (duration < LONG_PRESS_MS) {
+                Serial.println("❌ Pulsación BLOQUEADA - Solo reinicio largo permitido");
                 toneStart(500, 100); // Feedback de error
+                
+                // 🆕 MANTENER LA PANTALLA MOSTRANDO EL TIEMPO
+                showStatusScreen(lastStopTime, true);
+                
+                lastButtonState = currentState;
                 return;
             }
         }
         
-        // DETECCIÓN DE PULSACIÓN LARGA
+        // 🆕 DETECCIÓN DE PULSACIÓN LARGA (BARRA DE PROGRESO)
         if (currentState == LOW && !showingProgress) {
             uint32_t pressDuration = millis() - pressStartTime;
             
@@ -143,10 +150,10 @@ void handleButton() {
         }
         
         lastButtonState = currentState;
-        return;
+        return; // 🆕 SALIR TEMPRANO - NO PROCESAR MÁS LÓGICA
     }
     
-    // COMPORTAMIENTO NORMAL (solo si no hay último tiempo)
+    // 🆕 COMPORTAMIENTO NORMAL (solo si NO hay último tiempo mostrándose)
     if (lastButtonState == HIGH && currentState == LOW) {
         pressStartTime = millis();
         lastInteraction = millis();
@@ -166,8 +173,9 @@ void handleButton() {
             return;
         }
         
+        // 🆕 SOLO PERMITIR PULSACIONES CORTAS SI NO HAY TIEMPO GUARDADO
         if (duration > 100 && duration < 1000) {
-            if (!running && !finished) {
+            if (!running && !finished && lastStopTime < 0) {
                 Serial.println("🚀 SHORT PRESS - Iniciando stage");
                 startStage();
             } else if (running && !finished) {
@@ -180,7 +188,7 @@ void handleButton() {
         }
     }
     
-    // DETECCIÓN DE PULSACIÓN LARGA
+    // DETECCIÓN DE PULSACIÓN LARGA PARA COMPORTAMIENTO NORMAL
     if (currentState == LOW && !showingProgress) {
         uint32_t pressDuration = millis() - pressStartTime;
         
@@ -269,7 +277,7 @@ void updateDisplayHeader() {
     display.setCursor(SCREEN_WIDTH - 25, 0);
     display.print(wifiActive ? F("OK") : F("NO"));
     
-    // 🆕 USAR plateConnected
+    // USAR plateConnected
     display.setCursor(50, 0);
     display.print(F("Plate:"));
     display.print(plateConnected ? F("OK") : F("--"));
@@ -293,7 +301,7 @@ void showStatusScreen(float s, bool showTime) {
   display.setCursor(SCREEN_WIDTH - 25, 0);
   display.print(wifiActive ? F("OK") : F("NO"));
   
-  // 🆕 USAR plateConnected
+  // USAR plateConnected
   display.setCursor(50, 0);
   display.print(F("Plate:"));
   display.print(plateConnected ? F("OK") : F("--"));
@@ -465,6 +473,9 @@ void showResetProgress() {
 
 void startStage() {
   finished = false;
+  // 🆕 RESETEAR lastStopTime AL INICIAR NUEVO STAGE
+  lastStopTime = -1.0;
+  
   if (WiFi.status() != WL_CONNECTED) {
     WiFi.softAP(ssid, password);
   }
@@ -496,9 +507,10 @@ void resetStage() {
   running = false;
   finished = false;
   countdownActive = false;
-  // 🆕 RESETEA EL ESTADO DEL PLATE
+  // 🆕 RESETEA EL ESTADO DEL PLATE Y EL TIEMPO
   plateConnected = false;
   lastStopTime = -1.0;
+  
   if (WiFi.softAPgetStationNum() > 0) {
     WiFi.disconnect(true);
   }
@@ -531,7 +543,7 @@ void handleStandby() {
     uint32_t currentTime = millis();
     uint32_t inactiveTime = currentTime - lastInteraction;
     
-    if (inactiveTime > STANDBY_TIMEOUT_MS && screenActive && !showingProgress) {
+    if (inactiveTime > STANDBY_TIMEOUT_MS && screenActive && !showingProgress && !running && !countdownActive) {
         Serial.println("💤 Entrando en modo standby...");
         uint32_t animationStart = currentTime;
         bool visible = true;
@@ -567,7 +579,7 @@ void handleStandby() {
 void loop() {
     uint32_t currentTime = millis();
     
-    // 🆕 VERIFICAR TIMEOUT DE PING CADA 500ms
+    // VERIFICAR TIMEOUT DE PING CADA 500ms
     static uint32_t lastPingCheck = 0;
     if (currentTime - lastPingCheck >= 500) {
         lastPingCheck = currentTime;
@@ -639,7 +651,7 @@ void loop() {
             
             Serial.printf("📦 PAQUETE RECIBIDO: %s\n", msg);
             
-            // 🆕 DETECTAR MENSAJES PING
+            // DETECTAR MENSAJES PING
             if (strncmp(msg, "PING:", 5) == 0) {
                 uint16_t seq = atoi(msg + 5);
                 lastPingTime = currentTime;
@@ -661,7 +673,7 @@ void loop() {
                 Serial.printf("📤 PONG enviado: %s\n", pong);
             }
             else if (strncmp(msg, "HIT:", 4) == 0 && running && !finished) {
-                // 🆕 LOS HITS TAMBIÉN CUENTAN COMO PING
+                // LOS HITS TAMBIÉN CUENTAN COMO PING
                 lastPingTime = currentTime;
                 if (!plateConnected) {
                     plateConnected = true;
